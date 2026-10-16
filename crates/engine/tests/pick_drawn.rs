@@ -16,7 +16,7 @@ use cadcraft_engine::doc::geom::Vec3;
 use cadcraft_engine::doc::{Block, Circle, Common, Drawing, Entity, EntityKind, Handle, Insert, Line, Solid, Space};
 use cadcraft_engine::geom::{Bounds2, PolyVertex, Vec2};
 use cadcraft_engine::render;
-use cadcraft_engine::select::{pick, select_fence, select_window};
+use cadcraft_engine::select::{pick, select_fence, select_polygon, select_window};
 use serde_json::{Value, json};
 
 const AP: f64 = 0.25;
@@ -956,4 +956,238 @@ fn the_outline_of_a_wide_polyline_crossing_itself_by_the_thousand_takes_bounded_
     let _ = cadcraft_engine::select::hit_polylines(&d, &e, 1e-3);
     // Seconds at most, in a debug build too (it grew with the square of the triangles).
     assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+}
+
+/// A point on a letter of the TEXT `value` of height 1 at the origin.
+fn letter_of(d: &Drawing, value: &str) -> Vec2 {
+    on_letter(&strokes(d, &text(0.0, 0.0, 1.0, value)))
+}
+
+fn within(secs: u64, f: impl FnOnce()) {
+    let t = std::time::Instant::now();
+    f();
+    assert!(t.elapsed() < std::time::Duration::from_secs(secs), "{:?}", t.elapsed());
+}
+
+#[test]
+fn a_dense_array_of_a_long_text_is_picked_crossed_and_fenced_in_bounded_time() {
+    // 10,000 copies 0.01 apart, each of a text of 2,000 letters: every copy was shaped again.
+    let mut d = Drawing::new_metric();
+    let value = "W".repeat(2000);
+    define(&mut d, "S", vec![text(0.0, 0.0, 1.0, &value)]);
+    let mut i = insert("S", 0.0, 0.0);
+    i.cols = 100;
+    i.rows = 100;
+    i.col_spacing = 0.01;
+    i.row_spacing = 0.01;
+    let b = add(&mut d, EntityKind::Insert(i));
+    let on = letter_of(&d, &value);
+    within(2, || {
+        assert_eq!(at(&d, on.x, on.y), Some(b));
+        assert_eq!(at(&d, on.x, 500.0), None);
+        assert_eq!(crossing(&d, on.x - 0.01, on.y - 0.01, on.x + 0.01, on.y + 0.01), vec![b]);
+        assert_eq!(select_fence(&d, &Space::Model, &[Vec2::new(on.x, -5.0), Vec2::new(on.x, 5.0)]), vec![b]);
+    });
+}
+
+#[test]
+fn a_hostile_array_of_a_long_text_and_a_self_reference_takes_bounded_time() {
+    // 10,000 × 10,000 copies 1e-9 apart of a block with a text of 20,000 letters and a reference
+    // to itself: it took minutes.
+    let mut d = Drawing::new_metric();
+    let value = "W".repeat(20_000);
+    define(&mut d, "H", vec![text(0.0, 0.0, 1.0, &value), EntityKind::Insert(insert("H", 1.0, 1.0))]);
+    let mut i = insert("H", 0.0, 0.0);
+    i.cols = 10_000;
+    i.rows = 10_000;
+    i.col_spacing = 1e-9;
+    i.row_spacing = 1e-9;
+    let b = add(&mut d, EntityKind::Insert(i));
+    let on = letter_of(&d, &value);
+    within(10, || {
+        assert_eq!(at(&d, on.x, on.y), Some(b));
+        assert_eq!(crossing(&d, on.x - 0.01, on.y - 0.01, on.x + 0.01, on.y + 0.01), vec![b]);
+        assert_eq!(select_fence(&d, &Space::Model, &[Vec2::new(on.x, -5.0), Vec2::new(on.x, 5.0)]), vec![b]);
+        assert_eq!(
+            cadcraft_engine::select::select_polygon(&d, &Space::Model, &[Vec2::new(-5.0, -5.0), Vec2::new(5.0, -5.0), Vec2::new(5.0, 5.0)], true),
+            vec![b]
+        );
+    });
+}
+
+/// A block with a multiline attribute of two lines, the reference and the attribute's handle.
+fn multiline_attribute() -> (Drawing, Handle) {
+    let mut d = Drawing::new_metric();
+    define(&mut d, "A", vec![line(0.0, 0.0, 5.0, 0.0)]);
+    let mut i = insert("A", 10.0, 10.0);
+    let t = json!({ "insert": v3(12.0, 14.0), "height": 2.0, "value": "FIRST LINE\nSECOND LINE" });
+    let m = json!({ "insert": v3(12.0, 14.0), "height": 2.0, "width": 0.0, "contents": "FIRST LINE\\PSECOND LINE" });
+    let a = json!({ "tag": "N", "text": t, "multiline": { "mtext": m, "readAs": "FIRST LINE\nSECOND LINE" } });
+    i.attribs.push(serde_json::from_value(a).unwrap());
+    let h = add(&mut d, EntityKind::Insert(i));
+    (d, h)
+}
+
+/// The middles of the strokes the reference draws with its text on.
+fn drawn_mids(d: &Drawing, h: Handle) -> Vec<Vec2> {
+    let e = d.entity(h).unwrap();
+    let list = render::build_entities(d, std::iter::once(e.as_ref()), &render::Options::default());
+    let mut out = Vec::new();
+    for p in list.prims.iter().filter(|p| p.kind == render::Kind::Polyline) {
+        out.extend(list.points(p).windows(2).filter(|w| w[0].dist(w[1]) > 1e-6).map(|w| (w[0] + w[1]) * 0.5));
+    }
+    out
+}
+
+#[test]
+fn a_multiline_attribute_is_picked_crossed_and_fenced_where_its_multiline_text_is_drawn() {
+    let (d, h) = multiline_attribute();
+    let bounds = cadcraft_engine::doc::entity_bounds(&d, d.entity(h).unwrap(), 0);
+    let mids: Vec<Vec2> = drawn_mids(&d, h).into_iter().filter(|p| bounds.contains(*p)).collect();
+    assert!(mids.len() > 50, "{} strokes", mids.len());
+    for p in &mids {
+        assert_eq!(pick(&d, &Space::Model, *p, 0.05), Some(h), "pick at {p:?}");
+        assert_eq!(
+            select_window(&d, &Space::Model, Bounds2::new(*p - Vec2::new(0.01, 0.01), *p + Vec2::new(0.01, 0.01)), true),
+            vec![h],
+            "crossing at {p:?}"
+        );
+        assert_eq!(select_fence(&d, &Space::Model, &[*p - Vec2::new(0.011, 0.023), *p + Vec2::new(0.013, 0.017)]), vec![h], "fence at {p:?}");
+    }
+    // Not where the value would be drawn as one line of TEXT, away from every drawn stroke.
+    let t = serde_json::from_value(json!({ "insert": v3(12.0, 14.0), "height": 2.0, "value": "FIRST LINE\nSECOND LINE" })).unwrap();
+    let phantom: Vec<Vec2> = render::place_text_entity(&d, &t, "FIRST LINE\nSECOND LINE")
+        .0
+        .strokes
+        .iter()
+        .flat_map(|l| l.windows(2).map(|w| (w[0] + w[1]) * 0.5).collect::<Vec<_>>())
+        .filter(|p| mids.iter().chain(drawn_mids(&d, h).iter()).all(|q| q.dist(*p) > 0.3))
+        .collect();
+    assert!(!phantom.is_empty());
+    for p in &phantom {
+        assert_eq!(pick(&d, &Space::Model, *p, 0.05), None, "pick at {p:?}");
+        assert!(
+            select_window(&d, &Space::Model, Bounds2::new(*p - Vec2::new(0.01, 0.01), *p + Vec2::new(0.01, 0.01)), true).is_empty(),
+            "crossing at {p:?}"
+        );
+    }
+    // A window around every letter takes it.
+    let all = Bounds2::from_points(drawn_mids(&d, h)).expand(3.0);
+    assert_eq!(select_window(&d, &Space::Model, all, false), vec![h]);
+}
+
+/// Block "T" of a seating plan: a line and two labels, as a 100 x 100 MINSERT, 20 x 10 apart.
+fn seating_plan() -> (Drawing, Handle) {
+    let mut d = Drawing::new_metric();
+    define(
+        &mut d,
+        "T",
+        vec![line(0.0, 0.0, 10.0, 0.0), text(0.0, 1.0, 1.5, "SEAT 12 SECTION NORTH B"), text(0.0, 3.0, 1.0, "ROW A BLOCK 7 LEVEL 2 EAST")],
+    );
+    let mut i = insert("T", 0.0, 0.0);
+    i.cols = 100;
+    i.rows = 100;
+    i.col_spacing = 20.0;
+    i.row_spacing = 10.0;
+    let h = add(&mut d, EntityKind::Insert(i));
+    (d, h)
+}
+
+#[test]
+fn a_seating_plan_array_is_found_across_a_letter_of_any_cell_by_every_means() {
+    let (d, h) = seating_plan();
+    let s = strokes(&d, &text(0.0, 1.0, 1.5, "SEAT 12 SECTION NORTH B"));
+    let on = on_letter(&s);
+    let st = s.iter().find(|l| l.len() >= 2).unwrap();
+    let dir = (st[1] - st[0]).normalized().perp();
+    for (c, r) in [(0, 0), (50, 0), (0, 20), (0, 30), (0, 50), (99, 50), (0, 99), (99, 99)] {
+        let p = on + Vec2::new(20.0 * f64::from(c), 10.0 * f64::from(r));
+        let tri = [p + Vec2::new(-0.04, -0.04), p + Vec2::new(0.04, -0.04), p + Vec2::new(0.0, 0.05)];
+        let cell = format!("cell ({c},{r})");
+        assert_eq!(select_fence(&d, &Space::Model, &[p - dir * 0.05, p + dir * 0.05]), vec![h], "fence, {cell}");
+        assert_eq!(select_polygon(&d, &Space::Model, &tri, true), vec![h], "crossing polygon, {cell}");
+        assert_eq!(crossing(&d, p.x - 0.02, p.y - 0.02, p.x + 0.02, p.y + 0.02), vec![h], "crossing window, {cell}");
+        assert_eq!(pick(&d, &Space::Model, p, 0.05), Some(h), "pick, {cell}");
+    }
+}
+
+/// A text of about `points` points of letter outlines, and a point inside its rectangle that is
+/// well clear of its first letters' strokes.
+fn big_text(points: f64) -> (String, Vec2) {
+    let d = Drawing::new_metric();
+    let w = |v: &str| strokes(&d, &text(0.0, 0.0, 1.0, v)).iter().map(|l| l.len() + 1).sum::<usize>() as f64;
+    let n = (points / (w("WWWWWWWWWW") / 10.0)) as usize;
+    let value = "W".repeat(n);
+    let s = strokes(&d, &text(0.0, 0.0, 1.0, &value));
+    let dist = |pl: &[Vec2], p: Vec2| pl.windows(2).map(|w| cadcraft_engine::geom::Line::new(w[0], w[1]).dist(p)).fold(f64::INFINITY, f64::min);
+    let lb = Bounds2::from_points(s.iter().take(20).flatten().copied());
+    for i in 1..200 {
+        for j in 1..50 {
+            let p = Vec2::new(lb.min.x + (lb.max.x - lb.min.x) * f64::from(i) / 200.0, lb.min.y + (lb.max.y - lb.min.y) * f64::from(j) / 50.0);
+            if s.iter().take(40).all(|l| dist(l, p) > 0.08) {
+                return (value, p);
+            }
+        }
+    }
+    panic!("no blank place");
+}
+
+#[test]
+fn identical_references_give_the_same_answer_in_one_call_and_alone() {
+    let (value, blank) = big_text(700_000.0);
+    let two = |n: usize| {
+        let mut d = Drawing::new_metric();
+        define(&mut d, "BIG", vec![text(0.0, 0.0, 1.0, &value)]);
+        let hs: Vec<Handle> = (0..n).map(|_| add(&mut d, EntityKind::Insert(insert("BIG", 0.0, 0.0)))).collect();
+        (d, hs)
+    };
+    let s = strokes(&Drawing::new_metric(), &text(0.0, 0.0, 1.0, &value));
+    let on = on_letter(&s);
+    let dir = (s[0][1] - s[0][0]).normalized().perp();
+    let fence = [on - dir * 0.05, on + dir * 0.05];
+    let (d1, h1) = two(1);
+    let (d2, h2) = two(2);
+    let answers = |d: &Drawing| {
+        (
+            crossing(d, blank.x - 0.01, blank.y - 0.01, blank.x + 0.01, blank.y + 0.01),
+            pick(d, &Space::Model, blank, 0.02),
+            select_fence(d, &Space::Model, &fence),
+            crossing(d, on.x - 0.01, on.y - 0.01, on.x + 0.01, on.y + 0.01),
+        )
+    };
+    let (a1, a2) = (answers(&d1), answers(&d2));
+    // Alone: nothing at the blank place, the reference on a letter.
+    assert_eq!((a1.0.clone(), a1.1, a1.2.clone(), a1.3.clone()), (vec![], None, h1.clone(), h1.clone()));
+    // Two of them: both or neither, as alone.
+    assert_eq!((a2.0.clone(), a2.1, a2.2.clone(), a2.3.clone()), (vec![], None, h2.clone(), h2.clone()));
+}
+
+#[test]
+fn a_reference_past_the_work_allowed_is_tested_as_it_was_before_letters_were_picked() {
+    // 300 blocks of one text each, of about 20,000 points, drawn over each other: the call shapes
+    // about 200 of them, and the rest are tested on their block's geometry and bounding
+    // rectangle, as before. A place inside the text rectangle clear of every letter and of the
+    // rectangle's edges picks none of them.
+    let (value, blank) = big_text(20_000.0);
+    let mut d = Drawing::new_metric();
+    let mut hs = Vec::new();
+    for k in 0..300 {
+        define(&mut d, &format!("B{k}"), vec![text(0.0, 0.0, 1.0, &value), line(-1.0, -3.0, 1.0, -3.0)]);
+        hs.push(add(&mut d, EntityKind::Insert(insert(&format!("B{k}"), 0.0, 0.0))));
+    }
+    assert_eq!(pick(&d, &Space::Model, blank, 0.02), None);
+    // A fence through the geometry of the block takes every one of them.
+    let f = select_fence(&d, &Space::Model, &[Vec2::new(0.0, -4.0), Vec2::new(0.0, -2.0)]);
+    assert_eq!(f.len(), 300);
+}
+
+#[test]
+fn a_reference_whose_letters_in_reach_pass_its_share_is_tested_as_before_too() {
+    // A fence across the whole seating plan has every cell's labels in reach: far more than one
+    // reference may place, so it is tested on its geometry and rectangle, which the fence crosses.
+    // Time is bounded either way.
+    let (d, h) = seating_plan();
+    let t = std::time::Instant::now();
+    assert_eq!(select_fence(&d, &Space::Model, &[Vec2::new(-5.0, -5.0), Vec2::new(2000.0, 1005.0)]), vec![h]);
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
 }

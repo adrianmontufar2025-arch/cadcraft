@@ -2,10 +2,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use cadcraft_doc::{
-    AnnoDraw, Block, Common, Drawing, Entity, EntityKind, HAlign, Handle, Insert, LwPolyline, MAX_BLOCK_DEPTH, MText, Prim, Space, Text, anno_scaled,
-    entity_bounds,
+    AnnoDraw, Block, Common, Dimension, Drawing, Entity, EntityKind, HAlign, Handle, Insert, LwPolyline, MAX_BLOCK_DEPTH, MText, Prim, Space, Text,
+    anno_scaled, entity_bounds,
 };
 use cadcraft_geom::{Bounds2, Line, Mat3, Polyline, Segment, Vec2, point_in_polygon};
 
@@ -14,10 +15,16 @@ use crate::{Accept, Prompt};
 
 /// Polylines approximating an entity for hit testing, tessellated at `tol`.
 pub fn hit_polylines(d: &Drawing, e: &Entity, tol: f64) -> Vec<Vec<Vec2>> {
+    hit_polylines_in(d, e, tol, None, &mut TextCx::new())
+}
+
+/// [`hit_polylines`] within the text work `cx` still allows; with `near`, a block reference,
+/// dimension or multileader lays out only the text that may come within that box.
+pub(crate) fn hit_polylines_in(d: &Drawing, e: &Entity, tol: f64, near: Option<Bounds2>, cx: &mut TextCx) -> Vec<Vec<Vec2>> {
     match &e.kind {
         // A block reference, dimension or multileader is hit on what it draws and text on its
         // letters, not on the empty rest of their bounding rectangle or of the text's column.
-        EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => Drawn::of(d, e, tol, None).polylines(),
+        EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => Drawn::of(d, e, tol, near, cx).polylines(),
         EntityKind::Text(_) | EntityKind::AttDef(_) | EntityKind::MText(_) => letters_of(d, e).polylines(),
         EntityKind::Table(_) | EntityKind::Tolerance(_) | EntityKind::Image(_) => {
             // Tables, tolerances and images are hit inside their box.
@@ -76,12 +83,13 @@ fn dist_to_polyline(pts: &[Vec2], p: Vec2) -> f64 {
 /// Distance from `p` to the entity (0 inside the letters of an outline font, table and tolerance
 /// boxes and solid fills).
 pub fn entity_distance(d: &Drawing, e: &Entity, p: Vec2, tol: f64) -> f64 {
+    let mut cx = TextCx::new();
     match &e.kind {
-        EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => return Drawn::of(d, e, tol, None).distance(p),
+        EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => return Drawn::of(d, e, tol, None, &mut cx).distance(d, e, p),
         EntityKind::Text(_) | EntityKind::AttDef(_) | EntityKind::MText(_) => return letters_of(d, e).distance(p),
         _ => {}
     }
-    let polys = hit_polylines(d, e, tol);
+    let polys = hit_polylines_in(d, e, tol, None, &mut cx);
     let mut best = polys.iter().map(|pl| dist_to_polyline(pl, p)).fold(f64::INFINITY, f64::min);
     let filled = matches!(e.kind, EntityKind::Table(_) | EntityKind::Tolerance(_));
     if filled && entity_bounds(d, e, 0).contains(p) {
@@ -151,6 +159,7 @@ pub fn pick(d: &Drawing, space: &Space, p: Vec2, aperture: f64) -> Option<Handle
 pub(crate) fn pick_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, p: Vec2, aperture: f64) -> Option<Handle> {
     let probe = Bounds2::new(p, p).expand(aperture);
     let mut best: Option<(f64, Handle)> = None;
+    let mut cx = TextCx::new();
     for (e, known) in candidates(d, space, ix, &probe.expand(aperture), true, true)? {
         if !selectable(d, e) {
             continue;
@@ -161,7 +170,9 @@ pub(crate) fn pick_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<S
         }
         let dist = match &e.kind {
             // Only the text near the point is laid out.
-            EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => Drawn::of(d, e, aperture / 4.0, Some(probe)).distance(p),
+            EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_) => {
+                Drawn::of(d, e, aperture / 4.0, Some(probe), &mut cx).distance(d, e, p)
+            }
             _ => entity_distance(d, e, p, aperture / 4.0),
         };
         if dist <= aperture && best.is_none_or(|(bd, _)| dist < bd - 1e-12) {
@@ -203,7 +214,8 @@ pub fn select_window(d: &Drawing, space: &Space, bx: Bounds2, crossing: bool) ->
 pub(crate) fn select_window_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, bx: Bounds2, crossing: bool) -> Vec<Handle> {
     let Some(cands) = candidates(d, space, ix, &bx, crossing, false) else { return Vec::new() };
     let tol = window_tol(&bx);
-    cands.filter(|(e, known)| selectable(d, e) && in_window(d, e, *known, &bx, crossing, tol)).map(|(e, _)| e.handle).collect()
+    let mut cx = TextCx::new();
+    cands.filter(|(e, known)| selectable(d, e) && in_window(d, e, *known, &bx, crossing, tol, &mut cx)).map(|(e, _)| e.handle).collect()
 }
 
 /// The tessellation tolerance window and crossing tests use for a box.
@@ -213,7 +225,7 @@ pub(crate) fn window_tol(bx: &Bounds2) -> f64 {
 
 /// Whether a window box (`crossing` false: entirely inside) or a crossing box (inside or
 /// touching its geometry, not just its bounding box) selects `e`.
-pub(crate) fn in_window(d: &Drawing, e: &Entity, known: Option<Bounds2>, bx: &Bounds2, crossing: bool, tol: f64) -> bool {
+pub(crate) fn in_window(d: &Drawing, e: &Entity, known: Option<Bounds2>, bx: &Bounds2, crossing: bool, tol: f64, cx: &mut TextCx) -> bool {
     let infinite = is_infinite(e);
     let eb = bounds_of(d, e, known);
     if !infinite && bx.contains_box(&eb) {
@@ -234,9 +246,9 @@ pub(crate) fn in_window(d: &Drawing, e: &Entity, known: Option<Bounds2>, bx: &Bo
     // A crossing box selects a block reference, dimension or multileader across what it draws,
     // not inside the empty rest of its bounding rectangle.
     if matches!(e.kind, EntityKind::Insert(_) | EntityKind::Dimension(_) | EntityKind::MLeader(_)) {
-        return Drawn::of(d, e, tol, Some(*bx)).crossed_by(bx);
+        return Drawn::of(d, e, tol, Some(*bx), cx).crossed_by(bx, &eb);
     }
-    let polys = hit_polylines(d, e, tol);
+    let polys = hit_polylines_in(d, e, tol, None, cx);
     let hit = polys.iter().any(|pl| {
         if pl.len() == 1 {
             pl.first().is_some_and(|p| bx.contains(*p))
@@ -559,9 +571,14 @@ impl Letters {
     /// Add shaped text placed by `mm`. With `TEXTFILL` 0 outline glyphs are drawn, and picked, on
     /// their outline only.
     fn push(&mut self, d: &Drawing, strokes: Vec<Vec<Vec2>>, glyphs: Vec<Vec<Vec<Vec2>>>, mm: &Mat3) {
-        let place = |pl: Vec<Vec2>| pl.into_iter().map(|q| mm.apply(q)).collect::<Vec<_>>();
-        self.strokes.extend(strokes.into_iter().map(place));
-        let glyphs = glyphs.into_iter().map(|g| g.into_iter().map(place).collect::<Vec<_>>());
+        self.place(d, &Local::new(strokes, glyphs), mm);
+    }
+
+    /// Add letters laid out in their own coordinates, placed by `mm`.
+    fn place(&mut self, d: &Drawing, l: &Local, mm: &Mat3) {
+        let put = |pl: &Vec<Vec2>| pl.iter().map(|q| mm.apply(*q)).collect::<Vec<_>>();
+        self.strokes.extend(l.strokes.iter().map(put));
+        let glyphs = l.glyphs.iter().map(|g| g.iter().map(put).collect::<Vec<_>>());
         if d.header.i64("TEXTFILL", 1) == 0 {
             self.strokes.extend(glyphs.flatten().map(|c| ring(&c)));
         } else {
@@ -668,11 +685,39 @@ struct Drawn {
     letters: Letters,
     /// The bounding rectangle of one that isn't drawn (see [`Drawn::of`]).
     boxes: Vec<[Vec2; 4]>,
+    /// Set when its text could not be tested on its letters within the work allowed: it is then
+    /// tested as it was before letters were picked at all, and the rest is empty.
+    whole: Option<Whole>,
+}
+
+/// A block reference, dimension or multileader as it was hit before letters were picked: on the
+/// geometry the renderer draws without text and on the outline of its bounding rectangle, a
+/// dimension's or multileader's text also anywhere inside the box around its words, and a block
+/// reference by a crossing box lying wholly inside its bounding rectangle.
+struct Whole {
+    polys: Vec<Vec<Vec2>>,
+    insert: bool,
+}
+
+impl Whole {
+    fn of(d: &Drawing, e: &Entity, tol: f64) -> Whole {
+        let insert = matches!(e.kind, EntityKind::Insert(_));
+        let b = entity_bounds(d, e, 0);
+        if b.is_empty() {
+            return Whole { polys: Vec::new(), insert };
+        }
+        let c = b.corners();
+        let list =
+            cadcraft_render::build_entities(d, std::iter::once(e), &cadcraft_render::Options { tolerance: tol, text: false, ..Default::default() });
+        let mut polys: Vec<Vec<Vec2>> = list.prims.iter().map(|p| list.points(p).to_vec()).collect();
+        polys.push(vec![c[0], c[1], c[2], c[3], c[0]]);
+        Whole { polys, insert }
+    }
 }
 
 impl Drawn {
     /// What `e` draws; with `near`, only the text that may come within that box is laid out.
-    fn of(d: &Drawing, e: &Entity, tol: f64, near: Option<Bounds2>) -> Drawn {
+    fn of(d: &Drawing, e: &Entity, tol: f64, near: Option<Bounds2>, cx: &mut TextCx) -> Drawn {
         let mut out = Drawn::default();
         let Some(drawn) = as_drawn(d, e) else { return out };
         // One that isn't drawn (hidden, or on a layer that is off or frozen) is never picked, but
@@ -683,6 +728,29 @@ impl Drawn {
             if !b.is_empty() {
                 out.boxes.push(b.corners());
             }
+            return out;
+        }
+        // The texts of an object drawn at another scale are not the drawing's own: what is kept of
+        // them (keyed by where they are in memory) is for this object alone.
+        let saved = matches!(drawn, Cow::Owned(_)).then(|| std::mem::take(&mut cx.cache));
+        // As many objects as drawing it expands.
+        let mut w = Walk {
+            budget: cadcraft_render::MAX_BLOCK_EXPANSION,
+            near,
+            letters: Letters::default(),
+            lines: Vec::new(),
+            fallback: false,
+            own: MAX_REFERENCE_PLACED_POINTS,
+            cx,
+        };
+        parts_of(d, &drawn, &Mat3::IDENTITY, 0, &mut w);
+        let Walk { letters, lines, fallback, cx, .. } = w;
+        if let Some(saved) = saved {
+            cx.cache = saved;
+        }
+        // A text it can't test on its letters: the whole reference is tested as it was before.
+        if fallback {
+            out.whole = Some(Whole::of(d, e, tol));
             return out;
         }
         // Lines whole, across the gaps of their linetype, as they are picked on their own.
@@ -703,24 +771,30 @@ impl Drawn {
                 cadcraft_render::Kind::Polyline | cadcraft_render::Kind::Point => out.lines.push(pts.to_vec()),
             }
         }
-        // As many objects as drawing it expands.
-        let mut w = Walk { budget: cadcraft_render::MAX_BLOCK_EXPANSION, near, letters: Letters::default(), lines: Vec::new() };
-        parts_of(d, &drawn, &Mat3::IDENTITY, 0, &mut w);
-        out.letters = w.letters;
-        out.lines.extend(w.lines);
+        out.letters = letters;
+        out.lines.extend(lines);
         out
     }
 
     /// Its lines, the outlines of its letters and its bounding rectangle when it isn't drawn.
     fn polylines(self) -> Vec<Vec<Vec2>> {
+        if let Some(w) = self.whole {
+            return w.polys;
+        }
         let mut v = self.lines;
         v.extend(self.letters.polylines());
         v.extend(self.boxes.iter().map(closed));
         v
     }
 
-    /// Distance from `p` to what it draws: 0 inside a filled glyph.
-    fn distance(self, p: Vec2) -> f64 {
+    /// Distance from `p` to what it draws (`e` is the object): 0 inside a filled glyph.
+    fn distance(self, d: &Drawing, e: &Entity, p: Vec2) -> f64 {
+        if let Some(w) = self.whole {
+            if in_text(d, e, p) {
+                return 0.0;
+            }
+            return w.polys.iter().map(|pl| dist_to_polyline(pl, p)).fold(f64::INFINITY, f64::min);
+        }
         if self.boxes.iter().any(|b| point_in_polygon(b, p)) {
             return 0.0;
         }
@@ -728,10 +802,46 @@ impl Drawn {
         self.lines.iter().map(|pl| dist_to_polyline(pl, p)).fold(letters, f64::min)
     }
 
-    /// Whether a crossing box touches what it draws.
-    fn crossed_by(self, bx: &Bounds2) -> bool {
+    /// Whether a crossing box touches what it draws; `eb` is the bounding box of the object.
+    fn crossed_by(self, bx: &Bounds2, eb: &Bounds2) -> bool {
+        if let Some(w) = self.whole {
+            return w.polys.iter().any(|pl| polyline_meets_box(pl, bx)) || (w.insert && eb.contains_box(bx));
+        }
         self.lines.iter().any(|pl| polyline_meets_box(pl, bx)) || self.letters.crossed_by(bx) || self.boxes.iter().any(|b| area_meets_box(b, bx))
     }
+}
+
+/// Whether `p` is on the text of a dimension or multileader: inside the box around its words,
+/// turned with the text, as plain text is hit anywhere inside its box. Their other geometry is
+/// hit along its lines, so without this the cursor found the object only between the letters'
+/// edges and the lines.
+fn in_text(d: &Drawing, e: &Entity, p: Vec2) -> bool {
+    match &e.kind {
+        // A dimension with a block (as AutoCAD saves them) is drawn from that block: its text is
+        // the text there, not the text the dimension's own geometry would place.
+        EntityKind::Dimension(dm) => match dm.block.as_ref().and_then(|n| d.block(n)) {
+            Some(blk) => blk.entities.iter().any(|be| match &be.kind {
+                EntityKind::MText(t) => in_box(cadcraft_render::layout_mtext_entity(d, t).strokes.into_iter().flatten(), t.rotation, p),
+                EntityKind::Text(_) => entity_bounds(d, be, 0).contains(p),
+                _ => false,
+            }),
+            None => {
+                let g = cadcraft_render::dimension_in(d, dm);
+                in_box(g.text.iter().flatten().chain(g.text_glyphs.iter().flatten().flatten()).copied(), g.text_angle, p)
+            }
+        },
+        EntityKind::MLeader(m) => {
+            m.text.as_ref().is_some_and(|t| in_box(cadcraft_render::layout_mtext_entity(d, t).strokes.into_iter().flatten(), t.rotation, p))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `p` is inside the box around `pts` turned by `angle` (the box of text set at `angle`).
+fn in_box(pts: impl Iterator<Item = Vec2>, angle: f64, p: Vec2) -> bool {
+    let turn = |q: Vec2| q.rotate(-angle);
+    let b = Bounds2::from_points(pts.filter(|q| q.is_finite()).map(turn));
+    !b.is_empty() && b.contains(turn(p))
 }
 
 /// What a block reference at nesting `depth` draws besides its rendered lines, placed by `m` into
@@ -776,8 +886,10 @@ fn block_parts(d: &Drawing, ins: &Insert, m: &Mat3, depth: usize, w: &mut Walk) 
             if !c.visible || (c.layer != "0" && d.layer(&c.layer).is_some_and(|l| !l.visible())) {
                 continue;
             }
-            if w.may_reach_text(&a.text, &a.text.value, m) {
-                w.letters.push_text(d, &a.text, &a.text.value, m);
+            // Laid out as it is drawn: a multiline attribute as its multiline text.
+            match &a.multiline {
+                Some(_) => w.item(d, Key::new(KIND_ATTRIB_MTEXT, a), m, &|| a.multiline_text().map(Cow::Owned).map(Src::MText)),
+                None => w.item(d, Key::new(KIND_ATTRIB_TEXT, a), m, &|| Some(Src::Text(&a.text, &a.text.value))),
             }
         }
     }
@@ -815,8 +927,8 @@ fn parts_in(d: &Drawing, blk: &Block, mm: &Mat3, depth: usize, w: &mut Walk) {
 /// The parts of `e` (see [`block_parts`]), itself at nesting `depth`, placed by `mm`.
 fn parts_of(d: &Drawing, e: &Entity, mm: &Mat3, depth: usize, w: &mut Walk) {
     match &e.kind {
-        EntityKind::Text(t) if w.may_reach_text(t, &t.value, mm) => w.letters.push_text(d, t, &t.value, mm),
-        EntityKind::MText(t) if w.may_reach(d, t, mm) => w.letters.push_mtext(d, t, mm),
+        EntityKind::Text(t) => w.item(d, Key::new(KIND_TEXT, t), mm, &|| Some(Src::Text(t, &t.value))),
+        EntityKind::MText(t) => w.item(d, Key::new(KIND_MTEXT, t), mm, &|| Some(Src::MText(Cow::Borrowed(t)))),
         // A filled SOLID is filled across its second and third corners, and picked there too.
         EntityKind::Solid(s) if d.header.i64("FILLMODE", 1) != 0 => {
             let [_, b, c, _] = s.corners;
@@ -836,10 +948,7 @@ fn parts_of(d: &Drawing, e: &Entity, mm: &Mat3, depth: usize, w: &mut Walk) {
             Some(b) => parts_in(d, b, mm, depth, w),
             // Always laid out: its rough bounds don't hold its text (a long text of its own, a text
             // style of fixed height, alternate units, tolerances).
-            None => {
-                let g = cadcraft_render::dimension_in(d, dm);
-                w.letters.push(d, g.text, g.text_glyphs, mm);
-            }
+            None => w.item(d, Key::new(KIND_DIMENSION, dm), mm, &|| Some(Src::Dim(dm))),
         },
         // A multileader's block content is drawn at the multileader's own depth.
         EntityKind::MLeader(ml) => {
@@ -847,7 +956,7 @@ fn parts_of(d: &Drawing, e: &Entity, mm: &Mat3, depth: usize, w: &mut Walk) {
                 block_parts(d, content, mm, depth, w);
             }
             if let Some(t) = &ml.text {
-                w.letters.push_mtext(d, t, mm);
+                w.item(d, Key::new(KIND_MLEADER_TEXT, t), mm, &|| Some(Src::MText(Cow::Borrowed(t))));
             }
         }
         _ => {}
@@ -917,70 +1026,224 @@ fn wide_quads(p: &LwPolyline, mm: &Mat3, w: &mut Walk) {
     }
 }
 
+/// Most points of letter outlines one reference (or dimension, or multileader) may have placed
+/// into the drawing: about 16 MB of outlines, some milliseconds. Only the letters that may come
+/// within the box looked at are placed, so this is a few hundred cells of a block array with
+/// several labels, each cell some 1,500 points: a pick or a short fence tests one cell and a
+/// crossing box the few it touches. Shaping a text is not counted here, so identical references
+/// are treated alike whatever the order. A reference that would pass it is tested as it was
+/// before letters were picked (see [`Whole`]).
+const MAX_REFERENCE_PLACED_POINTS: usize = 1_000_000;
+
+/// Most points of letter outlines one selection (or pick, or fence) shapes in all, a text counting
+/// once however many places it is drawn in: some tenths of a second. A reference with a text left
+/// to shape past it, and every one after it in the order the candidates come, is tested as it was
+/// before letters were picked.
+const MAX_CALL_SHAPED_POINTS: usize = 4_000_000;
+
+/// Most points of letter outlines one selection places in all, over every reference it tests:
+/// four times the shaped, since a text is placed in many cells. Past it the references left, in
+/// the order the candidates come, are tested as before letters were picked. It only bounds a
+/// drawing of very many large references under one box; references tested before it is spent
+/// are not affected by it.
+const MAX_CALL_PLACED_POINTS: usize = 16_000_000;
+
+/// What kind of text a [`Key`] names (the same address can be the start of two of them).
+const KIND_TEXT: u8 = 0;
+const KIND_MTEXT: u8 = 1;
+const KIND_ATTRIB_TEXT: u8 = 2;
+const KIND_ATTRIB_MTEXT: u8 = 3;
+const KIND_DIMENSION: u8 = 4;
+const KIND_MLEADER_TEXT: u8 = 5;
+
+/// Which text of the drawing a cached layout is for: its kind and where it lies in memory. The
+/// objects are borrowed from the drawing for as long as the [`TextCx`] lives, so the address names
+/// one of them (see [`Drawn::of`] for the one that isn't).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key(u8, usize);
+
+impl Key {
+    fn new<T>(kind: u8, of: &T) -> Key {
+        Key(kind, std::ptr::from_ref(of).addr())
+    }
+}
+
+/// Letters laid out in the coordinates of their own block, once for every copy of it.
+struct Local {
+    strokes: Vec<Vec<Vec2>>,
+    glyphs: Vec<Vec<Vec<Vec2>>>,
+    /// Their points, a stroke or contour counting one more: what placing a copy costs.
+    points: usize,
+}
+
+impl Local {
+    fn new(strokes: Vec<Vec<Vec2>>, glyphs: Vec<Vec<Vec<Vec2>>>) -> Local {
+        let points = strokes.iter().chain(glyphs.iter().flatten()).fold(0usize, |n, pl| n.saturating_add(pl.len()).saturating_add(1));
+        Local { strokes, glyphs, points }
+    }
+}
+
+/// What one text of a block is, to be laid out.
+enum Src<'a> {
+    Text(&'a Text, &'a str),
+    MText(Cow<'a, MText>),
+    /// A dimension of the drawing without a block of its own, and the object it is.
+    Dim(&'a Dimension),
+}
+
+/// What is known of one text of the drawing during a selection: where its letters may reach and
+/// their layout, each worked out when first wanted.
+#[derive(Default)]
+struct Slot {
+    reach: Option<Option<Bounds2>>,
+    local: Option<Rc<Local>>,
+}
+
+/// The text work of one selection, pick or fence: every text of a block (one a block's every copy
+/// shows) is shaped once, charged to the selection, and the letters shaped and placed are limited.
+pub(crate) struct TextCx {
+    /// Points of letter outlines still to shape.
+    shape_left: usize,
+    /// Points of letter outlines still to place.
+    place_left: usize,
+    cache: HashMap<Key, Slot>,
+}
+
+impl TextCx {
+    pub(crate) fn new() -> TextCx {
+        TextCx { shape_left: MAX_CALL_SHAPED_POINTS, place_left: MAX_CALL_PLACED_POINTS, cache: HashMap::new() }
+    }
+}
+
+/// Within which box the letters of TEXT `t` showing `value` lie, judged without shaping it, in the
+/// coordinates of `t`: plain characters (see [`plain_char`]) of a positive height, neither aligned
+/// nor fit between two points and slanted 45° at most, stay within the reach of all its characters
+/// from the points it is placed by. `None` for any other text, which is shaped (one of no positive
+/// height is drawn one unit high).
+fn text_reach(t: &Text, value: &str) -> Option<Bounds2> {
+    if t.height.is_nan()
+        || t.height <= 0.0
+        || matches!(t.halign, HAlign::Aligned | HAlign::Fit)
+        || !value.chars().all(plain_char)
+        || t.oblique.is_nan()
+        || t.oblique.abs() > std::f64::consts::FRAC_PI_4
+    {
+        return None;
+    }
+    let n = value.chars().count() as f64 + 1.0;
+    let reach = n * t.height * 4.0 * t.width_factor.abs().max(1.0);
+    (reach.is_finite() && reach > 0.0).then(|| Bounds2::new(t.insert.xy(), t.justify_point()).expand(reach))
+}
+
+/// Within which box the words of MTEXT `t` lie, judged without laying it out, in the coordinates of
+/// `t`: plain text (see [`plain_mtext`]) in a style slanted 45° at most stays within the reach of
+/// all its characters, whether set on one line or wrapped one per line, from its insertion point.
+/// `None` for any other MTEXT, which is laid out.
+fn mtext_reach(d: &Drawing, t: &MText) -> Option<Bounds2> {
+    let style = d.text_style(&t.style);
+    if t.columns.is_some() || !plain_mtext(&t.contents) || style.is_some_and(|s| s.oblique.is_nan() || s.oblique.abs() > std::f64::consts::FRAC_PI_4)
+    {
+        return None;
+    }
+    let wf = style.map_or(1.0, |s| s.width_factor.abs()).max(1.0);
+    let ls = if t.line_spacing.is_finite() { t.line_spacing.max(1.0) } else { 1.0 };
+    // Across: its column, or a word running past it, each character at most four times the
+    // height wide. Down: a line per character at most, each 5/3 of the height apart.
+    let n = t.contents.chars().count() as f64 + 1.0;
+    let reach = n * t.height * 4.0 * wf * ls + t.width.abs();
+    if !(reach.is_finite() && t.height > 0.0) {
+        return None;
+    }
+    let o = t.insert.xy();
+    Some(Bounds2::new(o, o).expand(reach))
+}
+
 /// A walk through what a block reference draws: the objects it may still look at, the box looked
 /// at (text away from it isn't laid out), and the letters and lines found.
-struct Walk {
+struct Walk<'c> {
     budget: usize,
     near: Option<Bounds2>,
     letters: Letters,
     lines: Vec<Vec<Vec2>>,
+    /// A text could not be tested on its letters within the work allowed: the walk stopped, and
+    /// the whole reference is tested as before letters were picked (see [`Whole`]).
+    fallback: bool,
+    /// Points of letter outlines this walk may still place.
+    own: usize,
+    cx: &'c mut TextCx,
 }
 
-impl Walk {
+impl Walk<'_> {
     /// Whether box `b`, placed by `mm`, meets the box looked at (always, when there is none).
     fn meets(&self, b: &Bounds2, mm: &Mat3) -> bool {
         let Some(near) = self.near else { return true };
         !b.is_empty() && Bounds2::from_points(b.corners().map(|q| mm.apply(q))).intersects(&near)
     }
 
-    /// Whether the letters of TEXT `t` showing `value`, placed by `mm`, may come within the box
-    /// looked at, judged without shaping it: plain characters (see [`plain_char`]) of a positive
-    /// height, neither aligned nor fit between two points and slanted 45° at most, stay within the
-    /// reach of all its characters from the points it is placed by. Any other text is shaped (one
-    /// of no positive height is drawn one unit high).
-    fn may_reach_text(&self, t: &Text, value: &str, mm: &Mat3) -> bool {
-        if self.near.is_none()
-            || t.height.is_nan()
-            || t.height <= 0.0
-            || matches!(t.halign, HAlign::Aligned | HAlign::Fit)
-            || !value.chars().all(plain_char)
-            || t.oblique.is_nan()
-            || t.oblique.abs() > std::f64::consts::FRAC_PI_4
-        {
-            return true;
+    /// Add the text `key` names (`src` makes it) placed by `mm`, as it is drawn: not at all when
+    /// it can't come within the box looked at, else its letters, shaped once for all the places it
+    /// is drawn in. When the work allowed is spent the walk gives up (see [`Walk::fallback`]).
+    fn item<'a>(&mut self, d: &Drawing, key: Key, mm: &Mat3, src: &dyn Fn() -> Option<Src<'a>>) {
+        if self.fallback {
+            return;
         }
-        let n = value.chars().count() as f64 + 1.0;
-        let reach = n * t.height * 4.0 * t.width_factor.abs().max(1.0);
-        if !(reach.is_finite() && reach > 0.0) {
-            return true;
+        let reach = match self.cx.cache.get(&key).and_then(|s| s.reach) {
+            Some(r) => r,
+            None => {
+                let r = match src() {
+                    Some(Src::Text(t, v)) => text_reach(t, v),
+                    Some(Src::MText(t)) => mtext_reach(d, &t),
+                    Some(Src::Dim(_)) | None => None,
+                };
+                self.cx.cache.entry(key).or_default().reach = Some(r);
+                r
+            }
+        };
+        if self.near.is_some() && reach.is_some_and(|r| !self.meets(&r, mm)) {
+            return;
         }
-        self.meets(&Bounds2::new(t.insert.xy(), t.justify_point()).expand(reach), mm)
+        let local = match self.cx.cache.get(&key).and_then(|s| s.local.clone()) {
+            Some(l) => l,
+            None => {
+                if self.cx.shape_left == 0 {
+                    return self.give_up();
+                }
+                let Some(s) = src() else { return };
+                let (strokes, glyphs) = match s {
+                    Src::Text(t, v) => {
+                        let sh = cadcraft_render::place_text_entity(d, t, v).0;
+                        (sh.strokes, sh.glyphs)
+                    }
+                    Src::MText(t) => {
+                        let (mut strokes, mut glyphs) = (Vec::new(), Vec::new());
+                        for p in cadcraft_render::layout_mtext_entity(d, &t).pieces {
+                            strokes.extend(p.shaped.strokes);
+                            glyphs.extend(p.shaped.glyphs);
+                        }
+                        (strokes, glyphs)
+                    }
+                    Src::Dim(dm) => {
+                        let g = cadcraft_render::dimension_in(d, dm);
+                        (g.text, g.text_glyphs)
+                    }
+                };
+                let l = Rc::new(Local::new(strokes, glyphs));
+                self.cx.shape_left = self.cx.shape_left.saturating_sub(l.points);
+                self.cx.cache.entry(key).or_default().local = Some(Rc::clone(&l));
+                l
+            }
+        };
+        if local.points > self.own.min(self.cx.place_left) {
+            return self.give_up();
+        }
+        self.own -= local.points;
+        self.cx.place_left -= local.points;
+        self.letters.place(d, &local, mm);
     }
 
-    /// Whether the words of MTEXT `t`, placed by `mm`, may come within the box looked at, judged
-    /// without laying it out: plain text (see [`plain_mtext`]) in a style slanted 45° at most
-    /// stays within the reach of all its characters, whether set on one line or wrapped one per
-    /// line, from its insertion point. Any other MTEXT is laid out.
-    fn may_reach(&self, d: &Drawing, t: &MText, mm: &Mat3) -> bool {
-        let style = d.text_style(&t.style);
-        if self.near.is_none()
-            || t.columns.is_some()
-            || !plain_mtext(&t.contents)
-            || style.is_some_and(|s| s.oblique.is_nan() || s.oblique.abs() > std::f64::consts::FRAC_PI_4)
-        {
-            return true;
-        }
-        let wf = style.map_or(1.0, |s| s.width_factor.abs()).max(1.0);
-        let ls = if t.line_spacing.is_finite() { t.line_spacing.max(1.0) } else { 1.0 };
-        // Across: its column, or a word running past it, each character at most four times the
-        // height wide. Down: a line per character at most, each 5/3 of the height apart.
-        let n = t.contents.chars().count() as f64 + 1.0;
-        let reach = n * t.height * 4.0 * wf * ls + t.width.abs();
-        if !(reach.is_finite() && t.height > 0.0) {
-            return true;
-        }
-        let o = t.insert.xy();
-        self.meets(&Bounds2::new(o, o).expand(reach), mm)
+    fn give_up(&mut self) {
+        self.fallback = true;
+        self.budget = 0;
     }
 }
 
@@ -996,12 +1259,13 @@ pub(crate) fn select_fence_with(d: &Drawing, space: &Space, ix: &Option<std::syn
     let probe = fb.expand(tol);
     let Some(cands) = candidates(d, space, ix, &probe, true, false) else { return Vec::new() };
     let mut out = Vec::new();
+    let mut cx = TextCx::new();
     for (e, known) in cands {
         // Infinite objects have no useful bounds; like window selection, test their geometry directly.
         if !selectable(d, e) || (!is_infinite(e) && !bounds_of(d, e, known).intersects(&probe)) {
             continue;
         }
-        let polys = hit_polylines(d, e, tol);
+        let polys = hit_polylines_in(d, e, tol, Some(probe), &mut cx);
         let hit = fence.windows(2).any(|f| {
             let (Some(a), Some(b)) = (f.first(), f.get(1)) else { return false };
             let fl = Line::new(*a, *b);
@@ -1027,6 +1291,7 @@ pub fn select_polygon(d: &Drawing, space: &Space, poly: &[Vec2], crossing: bool)
     let edges: Vec<Line> =
         poly.windows(2).filter_map(|w| Some(Line::new(*w.first()?, *w.get(1)?))).chain(poly.last().map(|l| Line::new(*l, *first))).collect();
     let mut out = Vec::new();
+    let mut cx = TextCx::new();
     for (e, known) in cands {
         let infinite = is_infinite(e);
         if !selectable(d, e) || (infinite && !crossing) {
@@ -1036,7 +1301,7 @@ pub fn select_polygon(d: &Drawing, space: &Space, poly: &[Vec2], crossing: bool)
         if !infinite && if crossing { !eb.intersects(&pb) } else { !pb.contains_box(&eb) } {
             continue;
         }
-        let polys = hit_polylines(d, e, tol);
+        let polys = hit_polylines_in(d, e, tol, Some(pb), &mut cx);
         let crosses = polys.iter().any(|pl| {
             pl.windows(2).any(|w| {
                 w.first().zip(w.get(1)).is_some_and(|(p, q)| edges.iter().any(|f| cadcraft_geom::line_line(f, &Line::new(*p, *q)).is_some()))
@@ -1194,8 +1459,8 @@ mod solid_interior_tests {
         for solid in [true, false] {
             let mut d = Drawing::default();
             let e = face(solid, false);
-            assert!(in_window(&d, &e, None, &inside, true, 0.01));
-            assert!(!in_window(&d, &e, None, &inside, false, 0.01));
+            assert!(in_window(&d, &e, None, &inside, true, 0.01, &mut TextCx::new()));
+            assert!(!in_window(&d, &e, None, &inside, false, 0.01, &mut TextCx::new()));
             d.model.push(e);
             assert_eq!(select_window(&d, &Space::Model, inside, true), vec![Handle(256)]);
             assert!(select_window(&d, &Space::Model, inside, false).is_empty());
@@ -1207,9 +1472,9 @@ mod solid_interior_tests {
         let d = Drawing::default();
         let e = face(true, true);
         let empty = Bounds2::new(Vec2::new(7.0, 7.0), Vec2::new(8.0, 8.0));
-        assert!(!in_window(&d, &e, None, &empty, true, 0.01));
+        assert!(!in_window(&d, &e, None, &empty, true, 0.01, &mut TextCx::new()));
         let inside = Bounds2::new(Vec2::new(3.0, 3.0), Vec2::new(4.0, 4.0));
-        assert!(in_window(&d, &e, None, &inside, true, 0.01));
+        assert!(in_window(&d, &e, None, &inside, true, 0.01, &mut TextCx::new()));
     }
 
     #[test]
