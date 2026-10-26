@@ -326,21 +326,38 @@ fn scan() -> Registry {
         if let Some(paths) = std::env::var_os("CADCRAFT_SHXPATH") {
             let mut files = 0usize;
             for dir in std::env::split_paths(&paths).take(32) {
-                let Ok(entries) = std::fs::read_dir(dir) else { continue };
-                for entry in entries.take(MAX_FILES.saturating_sub(files)) {
-                    files += 1;
-                    let Ok(entry) = entry else { continue };
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("shx"))
-                        && let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(key)
-                    {
-                        registry.paths.entry(name).or_insert(path);
-                    }
-                }
+                files = scan_dir(&mut registry, &dir, files);
             }
         }
         registry
     }
+}
+
+/// Note the SHX files in `dir` (a name already found elsewhere keeps its first file), counting
+/// toward [`MAX_FILES`] from `files`; returns the new count.
+#[cfg(not(target_arch = "wasm32"))]
+fn scan_dir(registry: &mut Registry, dir: &std::path::Path, mut files: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else { return files };
+    for entry in entries.take(MAX_FILES.saturating_sub(files)) {
+        files += 1;
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("shx"))
+            && let Some(name) = path.file_name().and_then(|n| n.to_str()).and_then(key)
+        {
+            registry.paths.entry(name).or_insert(path);
+        }
+    }
+    files
+}
+
+/// Look for SHX fonts in `dir` too, after `CADCRAFT_SHXPATH` and the directories added before:
+/// for a host that knows where the user's fonts are installed. A name already found keeps its
+/// file.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn add_dir(dir: &std::path::Path) {
+    let mut registry = registry().lock().unwrap_or_else(PoisonError::into_inner);
+    scan_dir(&mut registry, dir, 0);
 }
 
 /// Register user-provided bytes (also works on WASM); never writes or embeds a font file.
