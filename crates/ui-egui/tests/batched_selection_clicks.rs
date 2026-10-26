@@ -104,3 +104,50 @@ fn clicks_consumed_by_a_finishing_drawing_prompt_are_not_replayed_as_selection()
     assert!(h.state().session.selection().is_empty(), "the radius click must not also select the circle it created");
     assert!(h.state().session.pending_window.unwrap().corner.near(Vec2::new(80.0, 80.0), 1e-4));
 }
+
+/// TRIM asks "Select object to trim" with a point prompt that picks objects: two complete clicks
+/// delivered in one slow frame trim both objects, as two separate clicks would.
+#[test]
+fn batched_clicks_at_a_prompt_picking_objects_trim_both() {
+    let mut session = Session::new();
+    session.new_drawing(false);
+    session.execute("line", &json!({"points":[[50,20],[50,80]]})).unwrap();
+    for y in [40, 60] {
+        session.execute("line", &json!({"points":[[10,y],[90,y]]})).unwrap();
+    }
+    session.execute("view.set", &json!({"center":[50,50],"height":100})).unwrap();
+    session.settings.osmode = 0;
+    session.settings.snapmode = false;
+    let mut app = CadApp::new(session, Services::default());
+    app.canvas.zoom_pending = false;
+    app.start("trim");
+    let mut h = Harness::builder().with_size(vec2(1600.0, 1000.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+        |ui, app: &mut CadApp| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        },
+        app,
+    );
+    h.run_steps(5);
+    for world in [Vec2::new(80.0, 40.0), Vec2::new(80.0, 60.0)] {
+        let pos = h.state().canvas.xf.unwrap().to_screen(world);
+        button(&mut h, pos, true, Modifiers::NONE);
+        button(&mut h, pos, false, Modifiers::NONE);
+    }
+    h.run_steps(1);
+    let mut ends: Vec<f64> = h
+        .state()
+        .session
+        .doc()
+        .unwrap()
+        .model
+        .iter()
+        .filter_map(|e| match &e.kind {
+            cadcraft_engine::doc::EntityKind::Line(l) if (l.a.y - l.b.y).abs() < 1e-9 => Some(l.a.x.max(l.b.x)),
+            _ => None,
+        })
+        .collect();
+    ends.sort_by(f64::total_cmp);
+    assert_eq!(ends.len(), 2);
+    assert!(ends.iter().all(|x| (x - 50.0).abs() < 1e-9), "both lines trimmed back to the cutting edge: {ends:?}");
+}

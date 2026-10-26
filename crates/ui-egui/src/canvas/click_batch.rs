@@ -36,8 +36,10 @@ pub(super) fn input(app: &mut CadApp, xf: &Xf, ui: &egui::Ui) -> bool {
     true
 }
 
+/// Idle, or a prompt whose clicks pick objects: a selection, or a point prompt that picks the
+/// object under the click ("Select object to trim"), where each click is one pick.
 fn selecting(app: &CadApp) -> bool {
-    !app.session.prompting() || app.session.current_prompt().is_some_and(|p| p.accept.select)
+    !app.session.prompting() || app.session.current_prompt().is_some_and(|p| p.picks_objects())
 }
 
 /// Accept only two or more complete primary clicks wholly inside this canvas in this frame.
