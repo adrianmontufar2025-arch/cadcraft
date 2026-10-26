@@ -97,6 +97,8 @@ pub struct GpuTarget {
     /// The stencil buffer format of the render pass, when it has one (the native window asks
     /// for one): clipped viewports are clipped with it.
     pub stencil: Option<wgpu::TextureFormat>,
+    /// Samples per pixel of the render pass (eframe `NativeOptions::multisampling`; 1: none).
+    pub samples: u32,
 }
 
 /// CPU-side vertex data for one display list, waiting to be uploaded.
@@ -677,17 +679,28 @@ impl GpuFaults {
 /// Create the canvas pipelines in the renderer's callback resources, and report wgpu errors and
 /// device loss to `faults` instead of panicking. Call once with the app's render state (eframe
 /// `CreationContext::wgpu_render_state`) and the format of its render pass's stencil buffer,
-/// if it has one (eframe `NativeOptions::stencil_buffer`).
-pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Option<wgpu::TextureFormat>) -> GpuTarget {
+/// if it has one (eframe `NativeOptions::stencil_buffer`), and its samples per pixel (eframe
+/// `NativeOptions::multisampling`, see [`msaa`]).
+pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Option<wgpu::TextureFormat>, samples: u32) -> GpuTarget {
     let f = Arc::clone(faults);
     rs.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| f.error(e.to_string())));
     let f = Arc::clone(faults);
     rs.device.set_device_lost_callback(move |reason, message| f.device_lost(reason, message));
-    let target = GpuTarget { format: rs.target_format, stencil: stencil.filter(|s| s.has_stencil_aspect()) };
+    let target = GpuTarget { format: rs.target_format, stencil: stencil.filter(|s| s.has_stencil_aspect()), samples: samples.max(1) };
     let res = Resources::new(&rs.device, target);
     rs.renderer.write().callback_resources.insert(res);
-    log::info!("gpu canvas: target {:?}, stencil {:?}", rs.target_format, target.stencil);
+    log::info!("gpu canvas: target {:?}, stencil {:?}, {} samples", rs.target_format, target.stencil, target.samples);
     target
+}
+
+/// Samples per pixel for the window (eframe `NativeOptions::multisampling`): 4, so lines and
+/// letters are drawn smooth, without stair steps; `env` (`CADCRAFT_MSAA`) 1, 2, 4 or 8 chooses
+/// another, 1 for none.
+pub fn msaa(env: Option<&str>) -> u16 {
+    match env.and_then(|v| v.trim().parse::<u16>().ok()) {
+        Some(n @ (1 | 2 | 4 | 8)) => n,
+        _ => 4,
+    }
 }
 
 impl egui_wgpu::CallbackTrait for CanvasCallback {
