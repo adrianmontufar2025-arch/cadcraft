@@ -37,6 +37,8 @@ pub struct TableText {
     pub at: Vec2,
     /// MTEXT attachment (1 top left … 9 bottom right).
     pub attach: u8,
+    /// Width the text wraps at: the cell's width less its margins.
+    pub width: f64,
     pub height: f64,
     pub color: Color,
     pub style: String,
@@ -314,6 +316,7 @@ fn layout(d: &Drawing, t: &Table) -> TableGeom {
             col: a.col,
             at: p(x, y),
             attach,
+            width: (x1 - x0 - 2.0 * cs.margin_h).max(0.0),
             height: cell.text_height.filter(|h| h.is_finite() && *h > 0.0).map_or(cs.text_height, |h| h * k),
             color: cs.text_color,
             style: cs.text_style.clone(),
@@ -355,9 +358,10 @@ pub(crate) fn draw(b: &mut Builder, ctx: &Ctx, t: &Table, rgb: Ink, lw: f32) {
         let ts = crate::text_style(ctx.d, &tx.style);
         let font = cadcraft_fonts::TextFont::resolve(&ts.font);
         // Cell content is MTEXT (`\P`, `{\Q15;…}`, `\F…;`): laid out as such, at the cell's
-        // alignment point (its numbering is MTEXT's attachment).
+        // alignment point (its numbering is MTEXT's attachment), wrapped at the cell's width.
         let mp = cadcraft_fonts::MTextParams {
             attach: tx.attach,
+            width: tx.width,
             font,
             width_factor: ts.width_factor,
             oblique: ts.oblique,
