@@ -87,6 +87,7 @@ mod native {
         let mut doc = outcome.document;
         table_merges(&mut doc);
         table_style_rows(&mut doc, false);
+        table_style_text_styles(&mut doc);
         let mut out = CappedWriter { buf: Vec::new(), limit: limits.max_dxf_bytes, exceeded: false };
         let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
             .map_err(|_| "the DWG→DXF conversion failed on this file".to_string())?;
@@ -260,6 +261,22 @@ mod native {
                     s.flags.set(bit, *suppressed);
                 } else {
                     *suppressed = s.flags.contains(bit);
+                }
+            }
+        }
+    }
+
+    /// A DWG names the text style of each cell type of a table style by handle; the reader keeps
+    /// the handle and leaves the name at "Standard", which is what acadrust writes to the DXF.
+    /// Name it after its handle, so the cells keep their own text style.
+    fn table_style_text_styles(doc: &mut acadrust::CadDocument) {
+        use acadrust::objects::ObjectType;
+        let names: std::collections::HashMap<acadrust::Handle, String> = doc.text_styles.iter().map(|s| (s.handle, s.name.clone())).collect();
+        for o in doc.objects.values_mut() {
+            let ObjectType::TableStyle(s) = o else { continue };
+            for row in [&mut s.data_row_style, &mut s.title_row_style, &mut s.header_row_style] {
+                if let Some(name) = row.text_style_handle.and_then(|h| names.get(&h)) {
+                    row.text_style_name = name.clone();
                 }
             }
         }
