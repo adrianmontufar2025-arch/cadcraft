@@ -258,6 +258,7 @@ fn main() -> eframe::Result {
         }
     }
     install_io();
+    let msaa = cadcraft_ui_egui::gpu::msaa(std::env::var("CADCRAFT_MSAA").ok().as_deref());
     let surface = cadcraft_ui_egui::gpu::surface_config(std::env::var("CADCRAFT_VSYNC").ok().as_deref(), cfg!(all(unix, not(target_os = "macos"))));
     let mut options = eframe::NativeOptions {
         // The crosshair is drawn by the app: present without a queue on Linux/BSD, where X11
@@ -275,6 +276,8 @@ fn main() -> eframe::Result {
         persist_window: false,
         // A stencil buffer clips the contents of clipped layout viewports on the GPU.
         stencil_buffer: STENCIL_BITS,
+        // Lines and letters drawn smooth (CADCRAFT_MSAA chooses the samples per pixel).
+        multisampling: msaa,
         ..Default::default()
     };
     if let Some(icon) = app_icon() {
@@ -344,7 +347,7 @@ fn main() -> eframe::Result {
                 app.frame_cap = Some(cadcraft_ui_egui::gpu::FrameCap::new(240));
             }
             if let Some(rs) = &cc.wgpu_render_state {
-                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(0, STENCIL_BITS));
+                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(0, STENCIL_BITS), msaa);
             }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());
