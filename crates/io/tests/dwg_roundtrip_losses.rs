@@ -103,6 +103,26 @@ fn dwg_keeps_table_styles() {
     assert_eq!(back.table_styles.iter().find(|s| s.name == "Sched"), Some(&sched));
 }
 
+/// The text style of a table style's cells: a DWG names it by handle, and its cells used to come
+/// back in Standard (the stroke font), wider than their own font, so their text ran past them.
+#[test]
+fn dwg_keeps_the_text_style_of_a_table_styles_cells() {
+    let mut d = Drawing::new_metric();
+    d.text_styles.push(TextStyle { name: "Tablas".into(), font: "arial.ttf".into(), ..TextStyle::default() });
+    let mut st = TableStyle { name: "Cuadro".into(), ..TableStyle::default() };
+    for kind in [CellStyle::DATA, CellStyle::HEADER, CellStyle::TITLE] {
+        let mut cs = st.cell_style(kind);
+        cs.text_style = "Tablas".into();
+        st.set_cell_style(cs);
+    }
+    d.table_styles.push(st);
+    let back = through_dwg(&d);
+    let st = back.table_styles.iter().find(|s| s.name == "Cuadro").unwrap();
+    for kind in [CellStyle::DATA, CellStyle::HEADER, CellStyle::TITLE] {
+        assert_eq!(st.cell_style(kind).text_style, "Tablas", "{kind}");
+    }
+}
+
 /// DWG doesn't store viewport ids; readers number a layout's viewports in order, and id 1 is the
 /// paper-space viewport (the sheet, not drawn). The writer puts that viewport ahead of a layout's
 /// own viewports, so a viewport made in CADCraft (id 2) keeps its id instead of becoming the
