@@ -568,7 +568,7 @@ impl Resources {
                 },
                 primitive: wgpu::PrimitiveState { topology, ..Default::default() },
                 depth_stencil: stencil_state(s),
-                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multisample: wgpu::MultisampleState { count: target.samples, mask: !0, alpha_to_coverage_enabled: false },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some("fs_main"),
