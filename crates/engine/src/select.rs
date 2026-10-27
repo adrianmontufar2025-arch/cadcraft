@@ -212,7 +212,9 @@ pub fn select_window(d: &Drawing, space: &Space, bx: Bounds2, crossing: bool) ->
 }
 
 pub(crate) fn select_window_with(d: &Drawing, space: &Space, ix: &Option<std::sync::Arc<SpatialIndex>>, bx: Bounds2, crossing: bool) -> Vec<Handle> {
-    let Some(cands) = candidates(d, space, ix, &bx, crossing, false) else { return Vec::new() };
+    // A crossing box may catch a POINT's figure away from the point itself.
+    let query = if crossing { bx.expand(point_reach(d)) } else { bx };
+    let Some(cands) = candidates(d, space, ix, &query, crossing, false) else { return Vec::new() };
     let tol = window_tol(&bx);
     let mut cx = TextCx::new();
     cands.filter(|(e, known)| selectable(d, e) && in_window(d, e, *known, &bx, crossing, tol, &mut cx)).map(|(e, _)| e.handle).collect()
@@ -232,16 +234,28 @@ pub(crate) fn in_window(d: &Drawing, e: &Entity, known: Option<Bounds2>, bx: &Bo
         return true;
     }
     // Text is selected on its letters: by a window around them all (not necessarily around the
-    // whole column of an MTEXT), and by a crossing box that touches them, not one between them.
-    if matches!(e.kind, EntityKind::Text(_) | EntityKind::AttDef(_) | EntityKind::MText(_)) {
+    // whole column of an MTEXT), and, as in Civil 3D, by a crossing box that catches the box
+    // around them (turned with the text), an empty corner of it too.
+    let angle = match &e.kind {
+        EntityKind::Text(t) => Some(t.rotation),
+        EntityKind::AttDef(a) => Some(a.text.rotation),
+        EntityKind::MText(t) => Some(t.rotation),
+        _ => None,
+    };
+    if let Some(angle) = angle {
         if !eb.intersects(bx) {
             return false;
         }
         let l = letters_of(d, e);
-        return l.within(bx) || (crossing && l.crossed_by(bx));
+        return l.within(bx) || (crossing && l.box_crossed_by(angle, bx));
     }
-    if !crossing || (!infinite && !eb.intersects(bx)) {
+    let reach = if matches!(e.kind, EntityKind::Point(_)) { point_reach(d) } else { 0.0 };
+    if !crossing || (!infinite && !eb.expand(reach).intersects(bx)) {
         return false;
+    }
+    // A POINT is crossed on the figure it draws, as in Civil 3D, not only at the point.
+    if let EntityKind::Point(p) = &e.kind {
+        return point_figure(d, p, tol).iter().any(|pl| polyline_meets_box(pl, bx));
     }
     // A crossing box selects a block reference, dimension or multileader across what it draws,
     // not inside the empty rest of its bounding rectangle.
@@ -304,6 +318,27 @@ fn polyline_meets_box(pl: &[Vec2], bx: &Bounds2) -> bool {
         [q] => bx.contains(*q),
         pl => pl.windows(2).any(|w| w.first().zip(w.get(1)).is_some_and(|(a, b)| seg_hits_box(*a, *b, bx))),
     }
+}
+
+/// The size a POINT's figure is drawn at: an absolute `PDSIZE`.
+// ponytail: a size relative to the screen (PDSIZE <= 0) isn't known here, so there the point is
+// crossed only at itself; pass the view height in if that matters.
+fn point_size(d: &Drawing) -> f64 {
+    let size = d.header.f64("PDSIZE", 0.0);
+    if size.is_finite() && size > 0.0 { size } else { 0.0 }
+}
+
+/// How far from the point its figure reaches (a square turned by 45° at most).
+fn point_reach(d: &Drawing) -> f64 {
+    point_size(d) * std::f64::consts::FRAC_1_SQRT_2
+}
+
+/// The figure POINT `p` draws (`PDMODE`) and the point itself.
+fn point_figure(d: &Drawing, p: &cadcraft_doc::Point, tol: f64) -> Vec<Vec<Vec2>> {
+    let at = p.p.xy();
+    let mut v = cadcraft_render::point::figure(d.header.i64("PDMODE", 0), point_size(d), at, p.angle, tol).lines;
+    v.push(vec![at]);
+    v
 }
 
 /// Whether box `bx` touches the area inside the closed polygon `poly`: crosses its edges, holds a
@@ -623,6 +658,13 @@ impl Letters {
         self.strokes.iter().any(|s| polyline_meets_box(s, bx))
             || self.glyphs.iter().flatten().any(|c| polyline_meets_box(&ring(c), bx))
             || self.inside(bx.center())
+    }
+
+    /// Whether a crossing box touches the box around the letters turned by `angle`.
+    fn box_crossed_by(&self, angle: f64, bx: &Bounds2) -> bool {
+        let pts = self.strokes.iter().chain(self.glyphs.iter().flatten()).flatten().filter(|q| q.is_finite());
+        let b = Bounds2::from_points(pts.map(|q| q.rotate(-angle)));
+        !b.is_empty() && area_meets_box(&b.corners().map(|c| c.rotate(angle)), bx)
     }
 
     /// Whether every letter lies inside box `bx` (never, when there are none).
