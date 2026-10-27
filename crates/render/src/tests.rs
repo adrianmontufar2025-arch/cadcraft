@@ -906,6 +906,24 @@ fn table_cell_text_height_scales_with_the_table() {
     assert_eq!(height(2.0, None), Some(base * 2.0));
 }
 
+/// A cell's text wraps at the cell's width less its margins, as AutoCAD lays it out (it was laid
+/// out on one line, running across the next cells).
+#[test]
+fn table_cell_text_wraps_at_the_cell_width() {
+    let mut d = Drawing::new_imperial();
+    let cell = cadcraft_doc::TableCell { text: "uno dos tres cuatro cinco seis siete ocho nueve diez".into(), text_height: Some(2.0), ..Default::default() };
+    let t = cadcraft_doc::Table { col_widths: vec![30.0], row_heights: vec![40.0], cells: vec![vec![cell]], ..Default::default() };
+    let margin = crate::table_style_of(&d, &t).cell_style(t.cell_style_name(0, 0)).margin_h;
+    let h = d.add(&Space::Model, Common::default(), EntityKind::Table(t)).unwrap();
+    let Some(EntityKind::Table(t)) = d.entity(h).map(|e| &e.kind) else { panic!() };
+    let tx = crate::table_geometry(&d, t).texts.first().cloned().unwrap();
+    let list = crate::build_entities(&d, d.entity(h).map(|e| e.as_ref()), &Options::default());
+    let xs: Vec<f64> = list.prims.iter().flat_map(|p| list.points(p).iter().map(|q| q.x)).collect();
+    let (lo, hi) = xs.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(*x), b.max(*x)));
+    assert!(lo >= -1e-6 && hi <= 30.0 + 1e-6, "the text stays inside its 30-wide cell: {lo}..{hi}");
+    assert!((tx.width - (30.0 - 2.0 * margin)).abs() < 1e-9, "wrap width {} with margin {margin}", tx.width);
+}
+
 #[test]
 fn cancelled_build_stops_early() {
     use std::sync::Arc;
