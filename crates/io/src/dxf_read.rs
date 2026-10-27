@@ -523,6 +523,27 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
     Some((c, k))
 }
 
+/// The groups of each cell of an ACAD_TABLE, row-major: each cell starts at a 171 group, and
+/// xdata ends the last one.
+fn table_cell_records(tags: &[Tag]) -> Vec<&[Tag]> {
+    let start = tags.iter().position(|x| x.code == 100 && x.str() == "AcDbTable").unwrap_or(0);
+    let tail = tags.get(start..).unwrap_or(&[]);
+    let body = tail.get(tail.iter().position(|x| x.code == 171).unwrap_or(tail.len())..).unwrap_or(&[]);
+    let body = body.get(..body.iter().position(|x| x.code >= 1000).unwrap_or(body.len())).unwrap_or(&[]);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(t0) = body.get(i) {
+        i += 1;
+        if t0.code != 171 {
+            continue;
+        }
+        let end = body.get(i..).and_then(|r| r.iter().position(|x| x.code == 171)).map(|p| i + p).unwrap_or(body.len());
+        out.push(body.get(i..end).unwrap_or(&[]));
+        i = end;
+    }
+    out
+}
+
 /// An ACAD_TABLE entity: sizes, cell texts and merges (DXF Reference), plus CADCraft's
 /// title/header flags, text height and style name from xdata when present.
 fn acad_table(tags: &[Tag]) -> Table {
@@ -545,22 +566,8 @@ fn acad_table(tags: &[Tag]) -> Table {
     row_heights.resize(rows, 0.27);
     let mut col_widths: Vec<f64> = head.all_f(142).into_iter().take(cols).map(size).collect();
     col_widths.resize(cols, 2.5);
-    // Cells, row-major, each starting at a 171 group; xdata ends the last one.
-    let body = tail.get(first_cell..).unwrap_or(&[]);
-    let body = body.get(..body.iter().position(|x| x.code >= 1000).unwrap_or(body.len())).unwrap_or(&[]);
     let mut flat: Vec<TableCell> = Vec::new();
-    let mut i = 0;
-    while let Some(t0) = body.get(i) {
-        if flat.len() >= rows * cols {
-            break;
-        }
-        i += 1;
-        if t0.code != 171 {
-            continue;
-        }
-        let end = body.get(i..).and_then(|r| r.iter().position(|x| x.code == 171)).map(|p| i + p).unwrap_or(body.len());
-        let cell = body.get(i..end).unwrap_or(&[]);
-        i = end;
+    for cell in table_cell_records(tags).into_iter().take(rows * cols) {
         let c = T(cell);
         let mut text: String = cell.iter().filter(|x| x.code == 2 || x.code == 3).map(Tag::str).collect();
         text.push_str(&c.s(1).unwrap_or_default());
@@ -975,6 +982,9 @@ struct Rx {
     inserted: std::collections::HashSet<String>,
     /// Tables whose style is known only by TABLESTYLE handle: (table, style handle).
     table_style_fix: Vec<(Handle, String)>,
+    /// Table cells whose content is a field (group 344, AutoCAD's formulas): (table, cell index
+    /// row-major, FIELD handle upper case), resolved with the objects.
+    table_fields: Vec<(Handle, usize, String)>,
     /// Multileaders' style handles and block attribute values, resolved with the objects.
     mleader_fix: Vec<(Handle, crate::dxf_mleader::Pending)>,
     /// Upper-case xref block name → the external drawing's path (BLOCK group 1).
@@ -1071,6 +1081,13 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
             let ours = crate::dxf_ext::xdata(tags, crate::dxf_ext::APP).iter().any(|t| t.code == 1000 && t.str() == "TABLE");
             if !ours {
                 rx.table_style_fix.push((h, t.s(342).map(|sh| sh.trim().to_ascii_uppercase()).unwrap_or_default()));
+            }
+            for (i, cell) in table_cell_records(tags).into_iter().enumerate() {
+                if let Some(f) = T(cell).s(344).map(|f| f.trim().to_ascii_uppercase()).filter(|f| !f.is_empty() && f != "0")
+                    && rx.table_fields.len() < MAX_OBJECTS
+                {
+                    rx.table_fields.push((h, i, f));
+                }
             }
         }
         ("INSERT", EntityKind::Insert(ins)) => {
@@ -1930,6 +1947,8 @@ struct Objects {
     layout_views: Vec<(String, (Vec2, f64))>,
     /// SORTENTSTABLE objects: (owning block record handle, entity handle → sort handle).
     sortents: Vec<(String, HashMap<Handle, u64>)>,
+    /// FIELD objects by handle (upper case).
+    fields: HashMap<String, Vec<Tag>>,
 }
 
 const MAX_OBJECTS: usize = 1_000_000;
@@ -1968,6 +1987,9 @@ impl Objects {
             "DIMASSOC" if self.dimassocs.len() < MAX_OBJECTS => self.dimassocs.push(tags.to_vec()),
             "MLEADERSTYLE" if self.mleader_styles.len() < MAX_OBJECTS => self.mleader_styles.push((h, tags.to_vec())),
             "GROUP" if self.groups.len() < MAX_OBJECTS => self.groups.push((h, tags.to_vec())),
+            "FIELD" if self.fields.len() < MAX_OBJECTS => {
+                self.fields.insert(h, tags.to_vec());
+            }
             "SORTENTSTABLE" if self.sortents.len() < MAX_OBJECTS => {
                 if let Some(t) = sortents_table(tags) {
                     self.sortents.push(t);
@@ -1981,6 +2003,22 @@ impl Objects {
             }
             _ => {}
         }
+    }
+
+    /// The formula and the value a FIELD showed: the formula of an `AcExpr` field, or of the one
+    /// child of AutoCAD's `_text` container a table cell points at; the value is its 301.
+    fn field_formula(&self, h: &str) -> (Option<String>, Option<String>) {
+        let Some(tags) = self.fields.get(h) else { return (None, None) };
+        let value = |tags: &[Tag]| tags.iter().rev().find(|x| x.code == 301).map(Tag::str).filter(|v| !v.trim().is_empty());
+        let formula = |tags: &[Tag]| {
+            let code: String = tags.iter().filter(|x| x.code == 2 || x.code == 3).map(Tag::str).collect();
+            (T(tags).s(1).as_deref() == Some("AcExpr")).then(|| acexpr(&code)).flatten()
+        };
+        let children: Vec<&Vec<Tag>> =
+            tags.iter().filter(|x| x.code == 360).filter_map(|x| self.fields.get(&x.str().trim().to_ascii_uppercase())).take(16).collect();
+        let f = formula(tags).or_else(|| children.iter().find_map(|c| formula(c)));
+        let v = value(tags).or_else(|| children.iter().find_map(|c| value(c)));
+        (f, v)
     }
 
     /// The text of the CADCraft XRECORD stored under `key` in a dictionary (its 1/3 strings).
@@ -2027,6 +2065,24 @@ impl Objects {
                         t.style = name;
                     }
                     t.text_height = height;
+                }
+            });
+        }
+        // Cells whose content is a field: AutoCAD's formulas, and the value they showed.
+        for (h, i, fh) in &rx.table_fields {
+            let (formula, value) = self.field_formula(fh);
+            if formula.is_none() && value.is_none() {
+                continue;
+            }
+            let _ = d.modify_entity(*h, |e| {
+                let EntityKind::Table(t) = &mut e.kind else { return };
+                let cols = t.col_widths.len();
+                let Some(c) = (cols > 0).then(|| t.cells.get_mut(i / cols).and_then(|r| r.get_mut(i % cols))).flatten() else { return };
+                if let Some(v) = value.filter(|_| c.text.is_empty()) {
+                    c.text = v;
+                }
+                if c.formula.is_none() {
+                    c.formula = formula.filter(|f| f.chars().count() <= 1024);
                 }
             });
         }
@@ -2102,6 +2158,30 @@ impl Objects {
             dimassoc(d, tags);
         }
     }
+}
+
+/// The formula of an AutoCAD `AcExpr` field code: `\AcExpr (E4-(C4+D4)) \f "%lu2"` is
+/// `=E4-(C4+D4)` (the expression, without its display format and its outer parentheses).
+fn acexpr(code: &str) -> Option<String> {
+    let body = code.trim().strip_prefix("\\AcExpr")?;
+    let expr = body.find("\\f ").and_then(|p| body.get(..p)).unwrap_or(body).trim();
+    // Outer parentheses around the whole expression (not `(A1)+(B1)`).
+    let mut depth = 0i32;
+    let mut whole = expr.starts_with('(') && expr.ends_with(')');
+    for (i, c) in expr.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && i + 1 < expr.len() {
+                    whole = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let expr = if whole { expr.get(1..expr.len() - 1).unwrap_or(expr).trim() } else { expr };
+    (!expr.is_empty()).then(|| format!("={expr}"))
 }
 
 /// Associativity from a DIMASSOC object (files from other writers).
