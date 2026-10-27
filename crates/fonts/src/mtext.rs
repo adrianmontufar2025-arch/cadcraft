@@ -152,6 +152,10 @@ struct Fmt {
     color: Option<MTextColor>,
     under: bool,
     over: bool,
+    /// `\K`: struck through.
+    strike: bool,
+    /// `\T`: tracking, the factor of the space each letter takes (1: as the font sets it).
+    track: f64,
     wf: f64,
     oblique: f64,
     /// `\A`: vertical alignment of tolerance stacks (`^`) on the line: 0 bottom, 1 centre, 2 top.
@@ -256,6 +260,8 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
             color: None,
             under: false,
             over: false,
+            strike: false,
+            track: 1.0,
             wf: 1.0,
             oblique: 0.0,
             valign: 1,
@@ -286,7 +292,8 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
                     'l' => derive(&mut fmts, &mut cur, &|f| f.under = false),
                     'O' => derive(&mut fmts, &mut cur, &|f| f.over = true),
                     'o' => derive(&mut fmts, &mut cur, &|f| f.over = false),
-                    'K' | 'k' => {}
+                    'K' => derive(&mut fmts, &mut cur, &|f| f.strike = true),
+                    'k' => derive(&mut fmts, &mut cur, &|f| f.strike = false),
                     'S' => {
                         let mut j = i;
                         let (mut top, mut bottom, mut sep) = (String::new(), String::new(), None);
@@ -336,6 +343,14 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
                         i = n;
                         if let Some(v) = num(a.trim_end_matches(['x', 'X'])).filter(|v| *v > 0.01 && *v < 100.0) {
                             derive(&mut fmts, &mut cur, &|f| f.wf = v);
+                        }
+                    }
+                    'T' => {
+                        let (a, n) = arg(&chars, i);
+                        i = n;
+                        // AutoCAD's range: 0.75 to 4.
+                        if let Some(v) = num(a.trim_end_matches(['x', 'X'])) {
+                            derive(&mut fmts, &mut cur, &|f| f.track = v.clamp(0.75, 4.0));
                         }
                     }
                     'Q' => {
@@ -407,9 +422,27 @@ fn parse(contents: &str, base: Fmt) -> (Vec<Atom>, Vec<Fmt>) {
     (atoms, fmts)
 }
 
+/// Letters of `t` with tracking `f.track` (`\T`): each letter at its place in the untracked text
+/// times the tracking, with its shape unchanged; and the width. None without tracking.
+// ponytail: each letter is measured by its prefix (O(n²)), so words past 256 letters are left untracked.
+fn tracked<'a>(t: &'a str, f: &Fmt) -> Option<(Vec<(f64, &'a str)>, f64)> {
+    if (f.track - 1.0).abs() < 1e-9 || t.chars().count() > 256 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut end = 0.0;
+    for (b, c) in t.char_indices() {
+        let x = text_width(&f.font, t.get(..b).unwrap_or(""), f.height, f.wf) * f.track;
+        let s = t.get(b..b + c.len_utf8()).unwrap_or("");
+        end = x + text_width(&f.font, s, f.height, f.wf);
+        out.push((x, s));
+    }
+    Some((out, end))
+}
+
 fn seg_width(seg: &Seg, f: &Fmt) -> f64 {
     match seg {
-        Seg::Text(t) => text_width(&f.font, t, f.height, f.wf),
+        Seg::Text(t) => tracked(t, f).map_or_else(|| text_width(&f.font, t, f.height, f.wf), |(_, w)| w),
         Seg::Stack(top, bottom, sep) => {
             let hs = f.height * STACK_SCALE;
             let wt = text_width(&f.font, top, hs, f.wf);
@@ -437,7 +470,14 @@ fn seg_shape(seg: &Seg, f: &Fmt, x: f64) -> Shaped {
     };
     let w = seg_width(seg, f);
     match seg {
-        Seg::Text(t) => out.extend(put(t, h, Vec2::new(x, 0.0))),
+        Seg::Text(t) => match tracked(t, f) {
+            Some((letters, _)) => {
+                for (lx, s) in letters {
+                    out.extend(put(s, h, Vec2::new(x + lx, 0.0)));
+                }
+            }
+            None => out.extend(put(t, h, Vec2::new(x, 0.0))),
+        },
         Seg::Stack(top, bottom, sep) => {
             let hs = h * STACK_SCALE;
             let wt = text_width(&f.font, top, hs, f.wf);
@@ -474,6 +514,9 @@ fn seg_shape(seg: &Seg, f: &Fmt, x: f64) -> Shaped {
     }
     if f.over {
         out.strokes.push(vec![Vec2::new(x, h * 1.2), Vec2::new(x + w, h * 1.2)]);
+    }
+    if f.strike {
+        out.strokes.push(vec![Vec2::new(x, h * 0.5), Vec2::new(x + w, h * 0.5)]);
     }
     out
 }
@@ -541,7 +584,8 @@ pub fn layout_mtext_with(contents: &str, p: &MTextParams) -> MTextLayout {
     let wf = if p.width_factor.is_finite() && p.width_factor > 0.0 { p.width_factor } else { 1.0 };
     let width = if p.width.is_finite() && p.width > 0.0 { p.width } else { 0.0 };
     let rotation = if p.rotation.is_finite() { p.rotation } else { 0.0 };
-    let base = Fmt { font: p.font.clone(), height: h, color: None, under: false, over: false, wf, oblique: p.oblique, valign: 1 };
+    let base =
+        Fmt { font: p.font.clone(), height: h, color: None, under: false, over: false, strike: false, track: 1.0, wf, oblique: p.oblique, valign: 1 };
     let (atoms, fmts) = parse(contents, base.clone());
     if para::needed(contents, p) {
         return para::layout(contents, p, &base);
@@ -760,6 +804,22 @@ mod tests {
         assert!(o.strokes.iter().any(|s| s.len() == 2 && s.iter().all(|p| (p.y - 0.2).abs() < 1e-9)));
     }
 
+    /// `\K…\k` strikes the letters through their middle; `\T` spreads them (tracking), keeping
+    /// each letter's shape.
+    #[test]
+    fn strike_through_and_tracking() {
+        let plain = lay("AB", 0.0).strokes.len();
+        let k = lay("\\KAB\\k", 0.0);
+        assert_eq!(k.strokes.len(), plain + 1, "a strike-through line");
+        // Top-left attachment: the baseline is one text height below the insert.
+        assert!(k.strokes.iter().any(|s| s.len() == 2 && s.iter().all(|p| (p.y + 0.5).abs() < 1e-9)));
+        let w = |s: &str| lay(s, 0.0).bounds.width();
+        assert!(w("\\T2;ABC") > w("ABC") * 1.5, "tracking 2 spreads the letters: {} vs {}", w("\\T2;ABC"), w("ABC"));
+        assert!((w("\\T1;ABC") - w("ABC")).abs() < 1e-9);
+        let letter = |s: &str| lay(s, 0.0).strokes.first().cloned();
+        assert_eq!(letter("\\T2;ABC"), letter("ABC"), "the first letter keeps its shape and place");
+    }
+
     #[test]
     fn stacked_fraction_is_small_over_large() {
         let l = lay("\\S1/2;", 0.0);
@@ -851,5 +911,26 @@ mod tests {
         }
         let long = "word ".repeat(5000);
         assert!(lay(&long, 10.0).lines.len() > 100);
+    }
+}
+
+#[cfg(test)]
+mod bold_italic {
+    use super::*;
+
+    /// `\fArial|b1|i1;` takes Arial's bold italic face, not its bold one (where Arial is installed).
+    #[test]
+    fn bold_and_italic_take_the_bold_italic_face() {
+        if crate::ttf::find("arial").is_none() {
+            return;
+        }
+        let names = |a: &str| match font_switch(a) {
+            Some(TextFont::Outline(f)) => f.names(),
+            _ => Vec::new(),
+        };
+        let bi = names("Arial|b1|i1");
+        assert!(bi.iter().any(|n| n.contains("bold") && n.contains("italic")), "{bi:?}");
+        let b = names("Arial|b1|i0");
+        assert!(b.iter().any(|n| n.contains("bold")) && !b.iter().any(|n| n.contains("italic")), "{b:?}");
     }
 }
