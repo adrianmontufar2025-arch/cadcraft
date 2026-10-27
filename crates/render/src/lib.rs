@@ -18,7 +18,7 @@ mod outline;
 pub mod paper;
 pub mod pen;
 mod plotstyle;
-mod point;
+pub mod point;
 pub mod raster;
 pub mod screen;
 mod text;

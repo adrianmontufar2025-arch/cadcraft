@@ -1,13 +1,16 @@
 //! Picking (and the hover highlight, which picks the same way), crossing and fence selection find
 //! a block reference only on what it draws: its lines and curves, the edges of its fills and the
-//! letters of its text. Text is found on its letters: not between them, nor across the whole width
-//! of an MTEXT's column. The empty rest of a block's bounding rectangle picks nothing.
+//! letters of its text. A click finds text on its letters: not between them, nor across the whole
+//! width of an MTEXT's column; a crossing box takes text on its own anywhere across the box around
+//! its letters, as Civil 3D does (see crossing_corner.rs). The empty rest of a block's bounding
+//! rectangle picks nothing.
 //!
-//! As AutoCAD does, observed with the same synthetic drawings: a click or a crossing window takes
-//! TEXT and MTEXT (on their own, in a block, turned, the text of a dimension) only on the strokes
-//! of their letters; a window around the letters of an MTEXT takes it though it doesn't hold its
-//! whole column; a SOLID or solid hatch inside a block is taken on its edges (a SOLID also on the
-//! diagonal it is filled across), a solid hatch on its own anywhere inside it.
+//! As AutoCAD does, observed with the same synthetic drawings: a click takes TEXT and MTEXT (on
+//! their own, in a block, turned, the text of a dimension) only on the strokes of their letters,
+//! and so does a crossing window the text in a block or of a dimension; a window around the
+//! letters of an MTEXT takes it though it doesn't hold its whole column; a SOLID or solid hatch
+//! inside a block is taken on its edges (a SOLID also on the diagonal it is filled across), a
+//! solid hatch on its own anywhere inside it.
 
 use std::sync::Arc;
 
@@ -516,9 +519,10 @@ fn text_is_picked_on_its_letters_not_between_them() {
     let (s, gap) = gap_of(&d, &k);
     let t = add(&mut d, k);
     assert_eq!(at(&d, on_letter(&s).x, on_letter(&s).y), Some(t));
-    // Between the letters, inside the box around them.
+    // Between the letters, inside the box around them: a click finds nothing there, a crossing box
+    // takes it (as in Civil 3D).
     assert_eq!(at(&d, gap.x, gap.y), None);
-    assert!(crossing(&d, gap.x - 1.0, gap.y - 1.0, gap.x + 1.0, gap.y + 1.0).is_empty());
+    assert_eq!(crossing(&d, gap.x - 1.0, gap.y - 1.0, gap.x + 1.0, gap.y + 1.0), vec![t]);
     let on = on_letter(&s);
     assert_eq!(crossing(&d, on.x - 0.1, on.y - 0.1, on.x + 0.1, on.y + 0.1), vec![t]);
 
@@ -554,7 +558,7 @@ fn text_in_a_block_is_picked_on_its_letters_not_between_them() {
 }
 
 #[test]
-fn an_mtext_is_selected_by_a_window_around_its_letters_and_crossed_only_on_them() {
+fn an_mtext_is_selected_by_a_window_around_its_letters_and_crossed_on_the_box_around_them() {
     let mut d = Drawing::new_metric();
     // A column 150 wide holding "I     I" and, a paragraph below, "I".
     let k = mtext(0.0, 0.0, 10.0, 150.0, "I     I\\PI");
@@ -564,8 +568,9 @@ fn an_mtext_is_selected_by_a_window_around_its_letters_and_crossed_only_on_them(
     let first_line: Vec<Vec2> = s.iter().flatten().copied().filter(|q| q.y > letters.center().y).collect();
     let gap = Bounds2::from_points(first_line).center();
     let t = add(&mut d, k);
-    // Between the two letters of the first line, and in the empty column right of them.
-    assert!(crossing(&d, gap.x - 1.0, gap.y - 1.0, gap.x + 1.0, gap.y + 1.0).is_empty());
+    // Between the two letters of the first line it is crossed (inside the box around them), not in
+    // the empty column right of them.
+    assert_eq!(crossing(&d, gap.x - 1.0, gap.y - 1.0, gap.x + 1.0, gap.y + 1.0), vec![t]);
     assert!(crossing(&d, 100.0, -6.0, 110.0, -4.0).is_empty());
     // A window around the letters selects it, though not around the whole column; one that cuts
     // through the letters doesn't.
